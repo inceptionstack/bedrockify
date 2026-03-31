@@ -87,6 +87,38 @@ var modelAliases = map[string]bedrockModel{
 	"deepseek/deepseek-r1":             {baseID: "deepseek.deepseek-r1-v1:0", crossRegion: true},
 }
 
+// embeddingAliases maps common embedding model names to Bedrock model IDs.
+// Embedding models don't use cross-region inference prefixes.
+var embeddingAliases = map[string]string{
+	// Titan Embed v2
+	"text-embedding-ada-002":              "amazon.titan-embed-text-v2:0",
+	"titan-embed-v2":                      "amazon.titan-embed-text-v2:0",
+	"titan-embed-text-v2":                 "amazon.titan-embed-text-v2:0",
+	"amazon/titan-embed-text-v2":          "amazon.titan-embed-text-v2:0",
+
+	// Titan Embed v1
+	"titan-embed-v1":                      "amazon.titan-embed-g1-text-02",
+	"titan-embed-text-v1":                 "amazon.titan-embed-g1-text-02",
+	"amazon/titan-embed-g1":               "amazon.titan-embed-g1-text-02",
+
+	// Cohere Embed v4
+	"cohere-embed-v4":                     "cohere.embed-v4:0",
+	"cohere/embed-v4":                     "cohere.embed-v4:0",
+	"embed-v4":                            "cohere.embed-v4:0",
+
+	// Cohere Embed English v3
+	"cohere-embed-english-v3":             "cohere.embed-english-v3",
+	"cohere/embed-english-v3":             "cohere.embed-english-v3",
+
+	// Cohere Embed Multilingual v3
+	"cohere-embed-multilingual-v3":        "cohere.embed-multilingual-v3",
+	"cohere/embed-multilingual-v3":        "cohere.embed-multilingual-v3",
+
+	// Titan Multimodal
+	"titan-embed-image-v1":                "amazon.titan-embed-image-v1:0",
+	"amazon/titan-embed-image-v1":         "amazon.titan-embed-image-v1:0",
+}
+
 // regionPrefix maps AWS region prefixes (first segment) to cross-region inference prefixes.
 var regionPrefixMap = map[string]string{
 	"us":  "us",
@@ -143,6 +175,28 @@ func ResolveModelAlias(model, region string) (string, bool) {
 	}
 
 	// No match — pass through as-is (let Bedrock reject if invalid)
+	return model, false
+}
+
+// ResolveEmbeddingAlias resolves common embedding model names to Bedrock model IDs.
+// Embedding models don't use cross-region inference prefixes.
+// Returns the resolved model ID and whether an alias was matched.
+func ResolveEmbeddingAlias(model string) (string, bool) {
+	if model == "" {
+		return model, false
+	}
+
+	// Already a Bedrock embedding ID (has a dot)
+	if strings.Contains(model, ".") {
+		return model, false
+	}
+
+	key := strings.ToLower(model)
+	if resolved, ok := embeddingAliases[key]; ok {
+		log.Printf("embedding alias: %q → %q", model, resolved)
+		return resolved, true
+	}
+
 	return model, false
 }
 

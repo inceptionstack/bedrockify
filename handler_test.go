@@ -161,13 +161,13 @@ func TestHandlerChatCompletions_EmptyMessages(t *testing.T) {
 }
 
 func TestHandlerChatCompletions_DefaultModel(t *testing.T) {
-	var capturedModel string
-	mock := &mockConverser{}
-	mock.converseResp = &ChatResponse{
-		ID:      "x",
-		Object:  "chat.completion",
-		Model:   "default-model",
-		Choices: []Choice{{Message: Message{Role: "assistant", Content: "hi"}, FinishReason: "stop"}},
+	mock := &mockConverser{
+		converseResp: &ChatResponse{
+			ID:      "x",
+			Object:  "chat.completion",
+			Model:   "default-model",
+			Choices: []Choice{{Message: Message{Role: "assistant", Content: "hi"}, FinishReason: "stop"}},
+		},
 	}
 
 	h := NewHandlerWithModel(mock, "default-model", "dev", "us-east-1")
@@ -179,7 +179,12 @@ func TestHandlerChatCompletions_DefaultModel(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	_ = capturedModel
+
+	var resp ChatResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Model != "default-model" {
+		t.Errorf("expected model 'default-model', got '%s'", resp.Model)
+	}
 }
 
 func TestHandlerModels(t *testing.T) {
@@ -765,4 +770,163 @@ func TestParseEmbedInputInvalid(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for numeric input")
 	}
+}
+
+// --- Chat error sanitization tests ---
+
+func TestChatBedrockErrorSanitized(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        string
+		wantStatus int
+		wantType   string
+		wantNoLeak string
+	}{
+		{
+			name:       "validation error",
+			err:        "bedrock converse: operation error Bedrock Runtime: Converse, ValidationException: The provided model identifier is invalid.",
+			wantStatus: http.StatusBadRequest,
+			wantType:   "invalid_request_error",
+			wantNoLeak: "ValidationException",
+		},
+		{
+			name:       "access denied",
+			err:        "AccessDeniedException: User arn:aws:iam::123456789:role/Foo is not authorized to perform bedrock:InvokeModel",
+			wantStatus: http.StatusUnauthorized,
+			wantType:   "authentication_error",
+			wantNoLeak: "arn:aws:iam",
+		},
+		{
+			name:       "throttling",
+			err:        "ThrottlingException: Too many requests, please slow down",
+			wantStatus: http.StatusTooManyRequests,
+			wantType:   "rate_limit_error",
+			wantNoLeak: "ThrottlingException",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockConverser{
+				converseErr: fmt.Errorf("%s", tt.err),
+			}
+			h := NewHandlerWithModel(mock, "test-model", "dev", "us-east-1")
+			body := `{"model":"test-model","messages":[{"role":"user","content":"Hi"}]}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("expected %d, got %d", tt.wantStatus, w.Code)
+			}
+
+			respBody := w.Body.String()
+			if strings.Contains(respBody, tt.wantNoLeak) {
+				t.Errorf("response leaked %q: %s", tt.wantNoLeak, respBody)
+			}
+
+			var errResp ErrorResponse
+			json.NewDecoder(strings.NewReader(respBody)).Decode(&errResp)
+			if errResp.Error.Type != tt.wantType {
+				t.Errorf("expected type=%q, got %q", tt.wantType, errResp.Error.Type)
+			}
+		})
+	}
+}
+
+// --- Embedding alias resolution via handler ---
+
+func TestEmbeddingAliasResolution(t *testing.T) {
+	mock := &mockEmbedder{
+		EmbedFunc: func(ctx context.Context, text string) ([]float64, error) {
+			return make([]float64, 256), nil
+		},
+	}
+	h := NewHandlerFull(&mockConverser{}, mock, "chat-model", "amazon.titan-embed-text-v2:0", "dev", "us-east-1")
+
+	// Send OpenAI-compatible model name — should resolve via alias
+	body, _ := json.Marshal(EmbeddingRequest{Input: "test", Model: "titan-embed-v2"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp EmbeddingResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Model != "amazon.titan-embed-text-v2:0" {
+		t.Errorf("expected resolved model, got '%s'", resp.Model)
+	}
+}
+
+// --- Both endpoints on same handler ---
+
+func TestUnifiedHandlerBothEndpoints(t *testing.T) {
+	chatMock := &mockConverser{
+		converseResp: &ChatResponse{
+			ID: "chat-1", Object: "chat.completion", Model: "test-chat",
+			Choices: []Choice{{Message: Message{Role: "assistant", Content: "hi"}, FinishReason: "stop"}},
+		},
+	}
+	embedMock := &mockEmbedder{
+		EmbedFunc: func(ctx context.Context, text string) ([]float64, error) {
+			return make([]float64, 512), nil
+		},
+	}
+	h := NewHandlerFull(chatMock, embedMock, "test-chat", "test-embed", "dev", "us-east-1")
+
+	// Chat
+	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"messages":[{"role":"user","content":"Hi"}]}`))
+	chatW := httptest.NewRecorder()
+	h.ServeHTTP(chatW, chatReq)
+	if chatW.Code != http.StatusOK {
+		t.Fatalf("chat: expected 200, got %d", chatW.Code)
+	}
+
+	// Embed
+	embedBody, _ := json.Marshal(EmbeddingRequest{Input: "test", Model: "test-embed"})
+	embedReq := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(embedBody))
+	embedW := httptest.NewRecorder()
+	h.ServeHTTP(embedW, embedReq)
+	if embedW.Code != http.StatusOK {
+		t.Fatalf("embed: expected 200, got %d: %s", embedW.Code, embedW.Body.String())
+	}
+
+	// Health shows both
+	healthReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	healthW := httptest.NewRecorder()
+	h.ServeHTTP(healthW, healthReq)
+	var health HealthResponse
+	json.NewDecoder(healthW.Body).Decode(&health)
+	if health.Model != "test-chat" || health.EmbedModel != "test-embed" {
+		t.Errorf("health: expected both models, got chat=%q embed=%q", health.Model, health.EmbedModel)
+	}
+}
+
+// --- Model alias via chat handler ---
+
+func TestChatModelAliasResolution(t *testing.T) {
+	var capturedModel string
+	mock := &mockConverser{
+		converseResp: &ChatResponse{
+			ID: "x", Object: "chat.completion",
+			Choices: []Choice{{Message: Message{Role: "assistant", Content: "hi"}, FinishReason: "stop"}},
+		},
+	}
+	// Wrap to capture the model after alias resolution
+	h := NewHandlerWithModel(mock, "us.anthropic.claude-opus-4-6-v1", "dev", "us-east-1")
+
+	// Send OpenRouter-style alias
+	body := `{"model":"anthropic/claude-opus-4.6","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = capturedModel
 }

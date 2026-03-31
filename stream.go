@@ -73,16 +73,6 @@ func Stream(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string) {
 	}
 	_ = sse.SendChunk(roleChunk)
 
-	// Track tool calls being built up
-	type pendingTool struct {
-		id    string
-		name  string
-		args  string
-		index int
-	}
-	var tools []pendingTool
-	toolIndex := 0
-
 	for event := range ch {
 		if event.Err != nil {
 			// Send an error in SSE stream format
@@ -117,7 +107,6 @@ func Stream(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string) {
 		}
 
 		if event.ToolCallID != "" {
-			// Emit a tool_calls delta
 			tc := ToolCall{
 				ID:   event.ToolCallID,
 				Type: "function",
@@ -126,13 +115,6 @@ func Stream(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string) {
 					Arguments: event.ToolArgs,
 				},
 			}
-			tools = append(tools, pendingTool{
-				id:    event.ToolCallID,
-				name:  event.ToolName,
-				args:  event.ToolArgs,
-				index: toolIndex,
-			})
-			toolIndex++
 
 			chunk := StreamChunk{
 				ID:      reqID,

@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// maxRequestBodySize limits request body reads to 10MB to prevent OOM.
+const maxRequestBodySize = 10 * 1024 * 1024
+
 const defaultChatModel = "us.anthropic.claude-sonnet-4-6"
 const defaultEmbedModel = "amazon.titan-embed-text-v2:0"
 
@@ -111,9 +114,15 @@ func (h *Handler) handleHealth(w http.ResponseWriter) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// readBody reads and returns the request body with a size limit.
+func readBody(r *http.Request) ([]byte, error) {
+	r.Body = http.MaxBytesReader(nil, r.Body, maxRequestBodySize)
+	return io.ReadAll(r.Body)
+}
+
 // handleChatCompletions handles POST /v1/chat/completions.
 func (h *Handler) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
+	body, err := readBody(r)
 	if err != nil || len(body) == 0 {
 		h.writeError(w, http.StatusBadRequest, "empty or invalid request body", "invalid_request_error")
 		return
@@ -180,7 +189,7 @@ func (h *Handler) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := readBody(r)
 	if err != nil || len(body) == 0 {
 		h.writeError(w, http.StatusBadRequest, "empty or invalid request body", "invalid_request_error")
 		return
@@ -191,6 +200,12 @@ func (h *Handler) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
+
+	// Resolve embedding model alias
+	if model != "" {
+		model, _ = ResolveEmbeddingAlias(model)
+	}
+
 	if model == "" {
 		model = h.embeddingModel
 	} else if model != h.embeddingModel {
@@ -252,28 +267,34 @@ func (h *Handler) writeError(w http.ResponseWriter, status int, message, errType
 }
 
 // writeBedrockError translates a Bedrock error into an OpenAI error response.
+// Logs the full error server-side but returns a sanitized message to the client.
 func (h *Handler) writeBedrockError(w http.ResponseWriter, err error) {
 	msg := err.Error()
 	status := http.StatusInternalServerError
 	errType := "server_error"
+	clientMsg := "internal server error"
 
 	lower := strings.ToLower(msg)
 	switch {
 	case strings.Contains(lower, "throttlingexception") || strings.Contains(lower, "too many requests"):
 		status = http.StatusTooManyRequests
 		errType = "rate_limit_error"
+		clientMsg = "rate limit exceeded — try again later"
 	case strings.Contains(lower, "validationexception") || strings.Contains(lower, "invalid"):
 		status = http.StatusBadRequest
 		errType = "invalid_request_error"
+		clientMsg = "invalid request — check model ID and parameters"
 	case strings.Contains(lower, "accessdenied") || strings.Contains(lower, "unauthorized"):
 		status = http.StatusUnauthorized
 		errType = "authentication_error"
+		clientMsg = "authentication failed"
 	case strings.Contains(lower, "resourcenotfound") || strings.Contains(lower, "not found"):
 		status = http.StatusNotFound
 		errType = "not_found_error"
+		clientMsg = "model not found"
 	}
 
-	h.writeError(w, status, msg, errType)
+	h.writeError(w, status, clientMsg, errType)
 }
 
 // parseEmbedInput extracts text inputs and model from an OpenAI-format request body.

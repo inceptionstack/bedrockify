@@ -61,6 +61,50 @@ func TestResolveModelAlias(t *testing.T) {
 	}
 }
 
+func TestResolveEmbeddingAlias(t *testing.T) {
+	tests := []struct {
+		name    string
+		model   string
+		want    string
+		wantHit bool
+	}{
+		// Common OpenAI name
+		{"openai compat", "text-embedding-ada-002", "amazon.titan-embed-text-v2:0", true},
+
+		// Short names
+		{"titan short", "titan-embed-v2", "amazon.titan-embed-text-v2:0", true},
+		{"cohere short", "cohere-embed-v4", "cohere.embed-v4:0", true},
+		{"embed-v4 short", "embed-v4", "cohere.embed-v4:0", true},
+
+		// Slash format
+		{"slash titan", "amazon/titan-embed-text-v2", "amazon.titan-embed-text-v2:0", true},
+		{"slash cohere", "cohere/embed-v4", "cohere.embed-v4:0", true},
+
+		// Already Bedrock IDs — pass through
+		{"bedrock titan", "amazon.titan-embed-text-v2:0", "amazon.titan-embed-text-v2:0", false},
+		{"bedrock cohere", "cohere.embed-v4:0", "cohere.embed-v4:0", false},
+
+		// Unknown — pass through
+		{"unknown", "some-random-model", "some-random-model", false},
+		{"empty", "", "", false},
+
+		// Case insensitive
+		{"case insensitive", "Titan-Embed-V2", "amazon.titan-embed-text-v2:0", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, gotHit := ResolveEmbeddingAlias(tt.model)
+			if got != tt.want {
+				t.Errorf("ResolveEmbeddingAlias(%q) = %q, want %q", tt.model, got, tt.want)
+			}
+			if gotHit != tt.wantHit {
+				t.Errorf("ResolveEmbeddingAlias(%q) hit = %v, want %v", tt.model, gotHit, tt.wantHit)
+			}
+		})
+	}
+}
+
 func TestRegionToCrossRegionPrefix(t *testing.T) {
 	tests := []struct {
 		region string
