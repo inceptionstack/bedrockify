@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Test
+        run: go test ./... -v
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build binaries
+        run: |
+          VERSION=${GITHUB_REF_NAME}
+          COMMIT=${GITHUB_SHA::8}
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}"
+
+          mkdir -p dist
+
+          GOOS=linux  GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o dist/bedrockify-linux-arm64  ./cmd/bedrockify/
+          GOOS=linux  GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/bedrockify-linux-amd64  ./cmd/bedrockify/
+          GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o dist/bedrockify-darwin-arm64 ./cmd/bedrockify/
+          GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/bedrockify-darwin-amd64 ./cmd/bedrockify/
+
+          cd dist && sha256sum bedrockify-* > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

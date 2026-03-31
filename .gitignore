@@ -1,0 +1,21 @@
+# Binaries
+bedrockify
+bedrockify-*
+dist/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Config with secrets
+bedrockify.toml
+
+# Temp files
+*.tmp
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp

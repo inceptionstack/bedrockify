@@ -1,0 +1,23 @@
+# bedrockify configuration
+# Docs: https://github.com/inceptionstack/bedrockify
+
+# AWS region for Bedrock
+region = "us-east-1"
+
+# Default chat model ID (client can override per-request)
+model = "us.anthropic.claude-opus-4-6-v1"
+
+# Default embedding model ID (set to "" to disable /v1/embeddings)
+embed_model = "amazon.titan-embed-text-v2:0"
+
+# Custom Bedrock endpoint URL (optional — overrides region-based endpoint)
+# Useful for VPC endpoints or non-standard deployments.
+# base_url = "https://vpce-xxx.bedrock-runtime.us-east-1.vpce.amazonaws.com"
+
+# Bedrock API key for bearer token auth (optional)
+# Leave empty to use IAM/SigV4 from instance profile or env credentials.
+# bearer_token = "ABSK..."
+
+# Proxy server settings
+port = 8090
+host = "127.0.0.1"
