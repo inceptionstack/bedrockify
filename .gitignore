@@ -1,6 +1,6 @@
-# Binaries
-bedrockify
-bedrockify-*
+# Binaries (root only, not cmd/)
+/bedrockify
+/bedrockify-*
 dist/
 
 # Go build artifacts
