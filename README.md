@@ -1,6 +1,8 @@
 # bedrockify ⚡
 
-> One binary. One port. OpenAI-compatible **chat completions** AND **embeddings** — both backed by Amazon Bedrock.
+> You want access to bedrock native embedding models for your OpenClaw/Hermes/Other agent.
+> You want access to Anthropic modles in bedrock under OpenAI compatible completions API for OpenClaw/Hermes/Other
+> Now you can have both. One binary. One port. OpenAI-compatible **chat completions** AND **embeddings** — both backed by Amazon Bedrock.
 
 ```
 POST /v1/chat/completions  →  Bedrock Converse API   (Claude, Nova, Llama, Mistral, DeepSeek…)
