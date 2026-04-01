@@ -1,6 +1,9 @@
 package bedrockify
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestResolveModelAlias(t *testing.T) {
 	tests := []struct {
@@ -126,5 +129,39 @@ func TestRegionToCrossRegionPrefix(t *testing.T) {
 				t.Errorf("regionToCrossRegionPrefix(%q) = %q, want %q", tt.region, got, tt.want)
 			}
 		})
+	}
+}
+
+// --- Feature 4: Application Inference Profiles ---
+
+func TestARNModelIDPassthrough(t *testing.T) {
+	arn := "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/my-profile"
+	resolved, changed := ResolveModelAlias(arn, "us-east-1")
+	if changed {
+		t.Errorf("ARN should pass through unchanged, but changed=true")
+	}
+	if resolved != arn {
+		t.Errorf("expected %q, got %q", arn, resolved)
+	}
+}
+
+func TestARNFoundationModelPassthrough(t *testing.T) {
+	arn := "arn:aws:bedrock:us-east-1:123456789012:foundation-model/anthropic.claude-3-sonnet"
+	resolved, changed := ResolveModelAlias(arn, "us-east-1")
+	if changed {
+		t.Errorf("ARN should pass through unchanged, but changed=true")
+	}
+	if resolved != arn {
+		t.Errorf("expected %q, got %q", arn, resolved)
+	}
+}
+
+func TestNonARNStillResolvesAliases(t *testing.T) {
+	resolved, changed := ResolveModelAlias("claude-opus", "us-east-1")
+	if !changed {
+		t.Errorf("expected alias resolution for 'claude-opus'")
+	}
+	if !strings.Contains(resolved, "anthropic.claude-opus") {
+		t.Errorf("expected resolved to contain 'anthropic.claude-opus', got %q", resolved)
 	}
 }

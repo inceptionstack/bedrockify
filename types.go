@@ -23,25 +23,29 @@ type Embedder interface {
 
 // ChatRequest is the OpenAI /v1/chat/completions request body.
 type ChatRequest struct {
-	Model       string      `json:"model"`
-	Messages    []Message   `json:"messages"`
-	MaxTokens   int         `json:"max_tokens,omitempty"`
-	Temperature *float64    `json:"temperature,omitempty"`
-	TopP        *float64    `json:"top_p,omitempty"`
-	Stream      bool        `json:"stream,omitempty"`
-	Stop        []string    `json:"stop,omitempty"`
-	Tools       []Tool      `json:"tools,omitempty"`
-	ToolChoice  interface{} `json:"tool_choice,omitempty"`
-	N           int         `json:"n,omitempty"`
+	Model               string                 `json:"model"`
+	Messages            []Message              `json:"messages"`
+	MaxTokens           int                    `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int                    `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64               `json:"temperature,omitempty"`
+	TopP                *float64               `json:"top_p,omitempty"`
+	Stream              bool                   `json:"stream,omitempty"`
+	Stop                []string               `json:"stop,omitempty"`
+	Tools               []Tool                 `json:"tools,omitempty"`
+	ToolChoice          interface{}            `json:"tool_choice,omitempty"`
+	N                   int                    `json:"n,omitempty"`
+	ReasoningEffort     string                 `json:"reasoning_effort,omitempty"`
+	ExtraBody           map[string]interface{} `json:"extra_body,omitempty"`
 }
 
 // Message is a single chat message.
 type Message struct {
-	Role       string      `json:"role"`
-	Content    interface{} `json:"content"` // string or []ContentPart
-	ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string      `json:"tool_call_id,omitempty"`
-	Name       string      `json:"name,omitempty"`
+	Role             string      `json:"role"`
+	Content          interface{} `json:"content"` // string or []ContentPart
+	ToolCalls        []ToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID       string      `json:"tool_call_id,omitempty"`
+	Name             string      `json:"name,omitempty"`
+	ReasoningContent string      `json:"reasoning_content,omitempty"`
 }
 
 // ContentPart is a typed content element (text, image_url, tool_result, etc.)
@@ -132,15 +136,18 @@ type StreamChoice struct {
 
 // Delta carries the incremental content for a streaming chunk.
 type Delta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
 }
 
 // StreamEvent is an internal event emitted during streaming.
 type StreamEvent struct {
 	// Text delta content
 	Text string
+	// Reasoning/thinking content delta
+	ReasoningContent string
 	// Tool call being built up
 	ToolCallID string
 	ToolName   string

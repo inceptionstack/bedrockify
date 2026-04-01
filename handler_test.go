@@ -906,6 +906,99 @@ func TestUnifiedHandlerBothEndpoints(t *testing.T) {
 	}
 }
 
+// --- Feature 4: ARN passthrough ---
+
+// captureConverser captures what model was passed in the request.
+type captureConverser struct {
+	capturedModel string
+	resp          *ChatResponse
+	events        []StreamEvent
+}
+
+func (c *captureConverser) Converse(_ context.Context, req *ChatRequest) (*ChatResponse, error) {
+	c.capturedModel = req.Model
+	if c.resp != nil {
+		return c.resp, nil
+	}
+	return &ChatResponse{
+		ID:     "chatcmpl-arn-test",
+		Object: "chat.completion",
+		Model:  req.Model,
+		Choices: []Choice{
+			{Index: 0, Message: Message{Role: "assistant", Content: "ok"}, FinishReason: "stop"},
+		},
+	}, nil
+}
+
+func (c *captureConverser) ConverseStream(_ context.Context, req *ChatRequest) (<-chan StreamEvent, error) {
+	c.capturedModel = req.Model
+	events := c.events
+	if events == nil {
+		events = []StreamEvent{{Text: "ok"}, {FinishReason: "stop"}}
+	}
+	ch := make(chan StreamEvent, len(events))
+	for _, e := range events {
+		ch <- e
+	}
+	close(ch)
+	return ch, nil
+}
+
+func (c *captureConverser) ListModels(_ context.Context) ([]ModelInfo, error) {
+	return nil, nil
+}
+
+func TestARNModelIDInResponse(t *testing.T) {
+	arn := "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/my-profile"
+	cap := &captureConverser{}
+	h := NewHandlerWithModel(cap, "default-model", "dev", "us-east-1")
+
+	body := `{"model":"` + arn + `","messages":[{"role":"user","content":"Hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify ARN passed through unchanged to converser
+	if cap.capturedModel != arn {
+		t.Errorf("expected ARN %q passed to converser, got %q", arn, cap.capturedModel)
+	}
+
+	var resp ChatResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Model != arn {
+		t.Errorf("expected model=%q in response, got %q", arn, resp.Model)
+	}
+}
+
+func TestARNModelIDStreaming(t *testing.T) {
+	arn := "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/prod-profile"
+	cap := &captureConverser{}
+	h := NewHandlerWithModel(cap, "default-model", "dev", "us-east-1")
+
+	body := `{"model":"` + arn + `","messages":[{"role":"user","content":"Hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if cap.capturedModel != arn {
+		t.Errorf("expected ARN %q passed to ConverseStream, got %q", arn, cap.capturedModel)
+	}
+	if !strings.Contains(w.Body.String(), "[DONE]") {
+		t.Error("expected [DONE] in SSE stream")
+	}
+}
+
 // --- Model alias via chat handler ---
 
 func TestChatModelAliasResolution(t *testing.T) {

@@ -127,11 +127,12 @@ func (b *BedrockConverser) ConverseStream(ctx context.Context, req *ChatRequest)
 	}
 
 	streamInput := &bedrockruntime.ConverseStreamInput{
-		ModelId:         input.ModelId,
-		Messages:        input.Messages,
-		System:          input.System,
-		InferenceConfig: input.InferenceConfig,
-		ToolConfig:      input.ToolConfig,
+		ModelId:                      input.ModelId,
+		Messages:                     input.Messages,
+		System:                       input.System,
+		InferenceConfig:              input.InferenceConfig,
+		ToolConfig:                   input.ToolConfig,
+		AdditionalModelRequestFields: input.AdditionalModelRequestFields,
 	}
 
 	start := time.Now()
@@ -171,6 +172,12 @@ func (b *BedrockConverser) ConverseStream(ctx context.Context, req *ChatRequest)
 				case *brtypes.ContentBlockDeltaMemberToolUse:
 					if d.Value.Input != nil {
 						currentToolArgsAccum.WriteString(aws.ToString(d.Value.Input))
+					}
+
+				case *brtypes.ContentBlockDeltaMemberReasoningContent:
+					// Emit reasoning/thinking delta
+					if rt, ok := d.Value.(*brtypes.ReasoningContentBlockDeltaMemberText); ok {
+						ch <- StreamEvent{ReasoningContent: rt.Value}
 					}
 				}
 
@@ -244,9 +251,37 @@ func (b *BedrockConverser) ListModels(ctx context.Context) ([]ModelInfo, error) 
 // --- Input builder ---
 
 func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.ConverseInput, error) {
+	// Determine effective max tokens (max_completion_tokens takes precedence)
+	maxTokens := req.MaxTokens
+	if req.MaxCompletionTokens > 0 {
+		maxTokens = req.MaxCompletionTokens
+	}
+
+	// Determine if prompt caching is requested via extra_body
+	cachingSystem, cachingMessages := extractPromptCachingConfig(req.ExtraBody)
+
 	messages, system, err := convertMessages(req.Messages)
 	if err != nil {
 		return nil, err
+	}
+
+	// Apply system prompt caching if requested
+	if cachingSystem && len(system) > 0 {
+		system = append(system, &brtypes.SystemContentBlockMemberCachePoint{
+			Value: brtypes.CachePointBlock{Type: brtypes.CachePointTypeDefault},
+		})
+	}
+
+	// Apply message prompt caching if requested (add cache point to penultimate user message)
+	if cachingMessages && len(messages) > 1 {
+		// Add cache point after the last-but-one turn (before the final user message)
+		idx := len(messages) - 2
+		if idx >= 0 {
+			messages[idx].Content = append(messages[idx].Content,
+				&brtypes.ContentBlockMemberCachePoint{
+					Value: brtypes.CachePointBlock{Type: brtypes.CachePointTypeDefault},
+				})
+		}
 	}
 
 	input := &bedrockruntime.ConverseInput{
@@ -258,8 +293,8 @@ func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.Conve
 	// Inference config
 	ic := &brtypes.InferenceConfiguration{}
 	hasIC := false
-	if req.MaxTokens > 0 {
-		ic.MaxTokens = aws.Int32(int32(req.MaxTokens))
+	if maxTokens > 0 {
+		ic.MaxTokens = aws.Int32(int32(maxTokens))
 		hasIC = true
 	}
 	if req.Temperature != nil {
@@ -287,7 +322,80 @@ func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.Conve
 		input.ToolConfig = toolConfig
 	}
 
+	// Thinking / reasoning config via AdditionalModelRequestFields
+	thinkingConfig := buildThinkingConfig(req, maxTokens)
+	if thinkingConfig != nil {
+		input.AdditionalModelRequestFields = brdoc.NewLazyDocument(thinkingConfig)
+	}
+
 	return input, nil
+}
+
+// buildThinkingConfig returns the AdditionalModelRequestFields map for thinking/reasoning,
+// or nil if no thinking config should be set.
+func buildThinkingConfig(req *ChatRequest, maxTokens int) map[string]interface{} {
+	// Priority 1: explicit extra_body.thinking config (Feature 2: Interleaved Thinking)
+	if req.ExtraBody != nil {
+		if thinking, ok := req.ExtraBody["thinking"].(map[string]interface{}); ok {
+			if ttype, ok := thinking["type"].(string); ok && ttype == "enabled" {
+				return map[string]interface{}{
+					"thinking": thinking,
+				}
+			}
+		}
+	}
+
+	// Priority 2: reasoning_effort field (Feature 1: Reasoning)
+	if req.ReasoningEffort != "" {
+		budget := computeReasoningBudget(req.ReasoningEffort, maxTokens)
+		return map[string]interface{}{
+			"thinking": map[string]interface{}{
+				"type":          "enabled",
+				"budget_tokens": budget,
+			},
+		}
+	}
+
+	return nil
+}
+
+// computeReasoningBudget maps a reasoning effort level to a token budget.
+// low=30%, medium=60%, high=100% of maxTokens, with a minimum of 1024.
+func computeReasoningBudget(effort string, maxTokens int) int {
+	if maxTokens <= 0 {
+		maxTokens = 8192 // sensible default
+	}
+	var fraction float64
+	switch effort {
+	case "low":
+		fraction = 0.30
+	case "medium":
+		fraction = 0.60
+	case "high":
+		fraction = 1.0
+	default:
+		fraction = 0.60
+	}
+	budget := int(float64(maxTokens) * fraction)
+	if budget < 1024 {
+		budget = 1024
+	}
+	return budget
+}
+
+// extractPromptCachingConfig reads prompt_caching config from extra_body.
+// Returns (cachingSystem, cachingMessages).
+func extractPromptCachingConfig(extraBody map[string]interface{}) (bool, bool) {
+	if extraBody == nil {
+		return false, false
+	}
+	pc, ok := extraBody["prompt_caching"].(map[string]interface{})
+	if !ok {
+		return false, false
+	}
+	cachingSystem, _ := pc["system"].(bool)
+	cachingMessages, _ := pc["messages"].(bool)
+	return cachingSystem, cachingMessages
 }
 
 // --- Message conversion ---
@@ -512,6 +620,7 @@ func parseConverseOutput(resp *bedrockruntime.ConverseOutput, modelID string) (*
 
 	var textParts []string
 	var toolCalls []ToolCall
+	var reasoningParts []string
 
 	for _, block := range msg.Value.Content {
 		switch b := block.(type) {
@@ -537,18 +646,23 @@ func parseConverseOutput(resp *bedrockruntime.ConverseOutput, modelID string) (*
 			})
 
 		case *brtypes.ContentBlockMemberReasoningContent:
-			// Thinking/reasoning blocks — strip by default (internal model reasoning)
-			// They could be exposed via a future --include-reasoning flag
-			_ = b
+			// Extract reasoning/thinking text
+			if rt, ok := b.Value.(*brtypes.ReasoningContentBlockMemberReasoningText); ok {
+				reasoningParts = append(reasoningParts, aws.ToString(rt.Value.Text))
+			}
 		}
 	}
 
 	content := strings.Join(textParts, "")
+	reasoningContent := strings.Join(reasoningParts, "")
 	finishReason := mapStopReason(string(resp.StopReason))
 
 	respMsg := Message{
 		Role:    "assistant",
 		Content: content,
+	}
+	if reasoningContent != "" {
+		respMsg.ReasoningContent = reasoningContent
 	}
 	if len(toolCalls) > 0 {
 		respMsg.ToolCalls = toolCalls

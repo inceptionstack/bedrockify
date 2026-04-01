@@ -106,6 +106,22 @@ func Stream(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string) {
 			_ = sse.SendChunk(chunk)
 		}
 
+		if event.ReasoningContent != "" {
+			chunk := StreamChunk{
+				ID:      reqID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []StreamChoice{
+					{
+						Index: 0,
+						Delta: Delta{ReasoningContent: event.ReasoningContent},
+					},
+				},
+			}
+			_ = sse.SendChunk(chunk)
+		}
+
 		if event.ToolCallID != "" {
 			tc := ToolCall{
 				ID:   event.ToolCallID,
