@@ -614,8 +614,8 @@ func TestReasoningEffortMapping(t *testing.T) {
 		{"low", 4096, 1024, 1228},
 		// medium = 60% of max_tokens
 		{"medium", 4096, 2000, 2500},
-		// high = 100% of max_tokens
-		{"high", 4096, 4000, 4096},
+		// high = max_tokens - 1 (BAG spec)
+		{"high", 4096, 4095, 4095},
 		// min budget floor = 1024
 		{"low", 100, 1024, 1024},
 		{"medium", 100, 1024, 1024},
@@ -1055,7 +1055,8 @@ func TestMaxTokensNotBumpedWhenBudgetUnderMax(t *testing.T) {
 }
 
 func TestMaxTokensBumpedForReasoningEffortHigh(t *testing.T) {
-	// reasoning_effort=high with max=4096 → budget=4096 (100%), must bump
+	// reasoning_effort=high with max=4096 → budget=4095 (max-1), no auto-bump needed
+	// The new BAG spec: high = max_tokens - 1, so maxTokens > budgetTokens → no bump
 	req := &ChatRequest{
 		Model:               "us.anthropic.claude-sonnet-4-6",
 		Messages:            []Message{{Role: "user", Content: "test"}},
@@ -1066,9 +1067,18 @@ func TestMaxTokensBumpedForReasoningEffortHigh(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	if input.InferenceConfig == nil || input.InferenceConfig.MaxTokens == nil {
+		t.Fatal("expected InferenceConfig.MaxTokens to be set")
+	}
 	maxTokens := int(*input.InferenceConfig.MaxTokens)
-	if maxTokens <= 4096 {
-		t.Errorf("expected max_tokens > 4096 for high reasoning, got %d", maxTokens)
+	// high = max_tokens - 1 = 4095 < max_tokens=4096, so no bump
+	if maxTokens != 4096 {
+		t.Errorf("expected max_tokens=4096 (no bump needed for high), got %d", maxTokens)
+	}
+	// Verify budget is max_tokens-1
+	budget := computeReasoningBudget("high", 4096)
+	if budget != 4095 {
+		t.Errorf("expected budget=4095 (max-1), got %d", budget)
 	}
 }
 
@@ -1136,5 +1146,68 @@ func TestMaxCompletionTokensJSON(t *testing.T) {
 	}
 	if req.MaxTokens != 100 {
 		t.Errorf("expected MaxTokens=100, got %d", req.MaxTokens)
+	}
+}
+
+// --- Feature 1.1: topP removal when reasoning/thinking enabled ---
+
+func TestTopPRemovedWhenReasoningEnabled(t *testing.T) {
+	topP := 0.9
+	req := &ChatRequest{
+		Model:               "us.anthropic.claude-sonnet-4-6",
+		Messages:            []Message{{Role: "user", Content: "test"}},
+		MaxCompletionTokens: 4096,
+		TopP:                &topP,
+		ReasoningEffort:     "low",
+	}
+	input, err := buildConverseInput("us.anthropic.claude-sonnet-4-6", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if input.InferenceConfig != nil && input.InferenceConfig.TopP != nil {
+		t.Errorf("expected TopP to be nil when reasoning is enabled, got %v", *input.InferenceConfig.TopP)
+	}
+}
+
+func TestTopPPreservedWithoutReasoning(t *testing.T) {
+	topP := 0.9
+	req := &ChatRequest{
+		Model:     "us.anthropic.claude-sonnet-4-6",
+		Messages:  []Message{{Role: "user", Content: "test"}},
+		MaxTokens: 100,
+		TopP:      &topP,
+	}
+	input, err := buildConverseInput("us.anthropic.claude-sonnet-4-6", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if input.InferenceConfig == nil || input.InferenceConfig.TopP == nil {
+		t.Fatal("expected TopP to be preserved when no reasoning")
+	}
+	if *input.InferenceConfig.TopP != 0.9 {
+		t.Errorf("expected TopP=0.9, got %v", *input.InferenceConfig.TopP)
+	}
+}
+
+func TestTopPRemovedWithExtraBodyThinking(t *testing.T) {
+	topP := 0.95
+	req := &ChatRequest{
+		Model:     "us.anthropic.claude-sonnet-4-6",
+		Messages:  []Message{{Role: "user", Content: "test"}},
+		MaxTokens: 2048,
+		TopP:      &topP,
+		ExtraBody: map[string]interface{}{
+			"thinking": map[string]interface{}{
+				"type":          "enabled",
+				"budget_tokens": float64(4096),
+			},
+		},
+	}
+	input, err := buildConverseInput("us.anthropic.claude-sonnet-4-6", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if input.InferenceConfig != nil && input.InferenceConfig.TopP != nil {
+		t.Errorf("expected TopP to be nil when extra_body thinking enabled, got %v", *input.InferenceConfig.TopP)
 	}
 }

@@ -30,12 +30,18 @@ type ChatRequest struct {
 	Temperature         *float64               `json:"temperature,omitempty"`
 	TopP                *float64               `json:"top_p,omitempty"`
 	Stream              bool                   `json:"stream,omitempty"`
+	StreamOptions       *StreamOptions         `json:"stream_options,omitempty"`
 	Stop                []string               `json:"stop,omitempty"`
 	Tools               []Tool                 `json:"tools,omitempty"`
 	ToolChoice          interface{}            `json:"tool_choice,omitempty"`
 	N                   int                    `json:"n,omitempty"`
 	ReasoningEffort     string                 `json:"reasoning_effort,omitempty"`
 	ExtraBody           map[string]interface{} `json:"extra_body,omitempty"`
+}
+
+// StreamOptions controls streaming behavior.
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 // Message is a single chat message.
@@ -110,9 +116,21 @@ type Choice struct {
 
 // Usage reports token consumption (shared by chat and embeddings).
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens,omitempty"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens,omitempty"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// PromptTokensDetails holds granular prompt token breakdown.
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
+// CompletionTokensDetails holds granular completion token breakdown.
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // --- Streaming types ---
@@ -148,6 +166,8 @@ type StreamEvent struct {
 	Text string
 	// Reasoning/thinking content delta
 	ReasoningContent string
+	// Reasoning signature (feature 5.3)
+	ReasoningSignature string
 	// Tool call being built up
 	ToolCallID string
 	ToolName   string
@@ -180,14 +200,18 @@ type ModelsResponse struct {
 
 // EmbeddingRequest is a single-string input request.
 type EmbeddingRequest struct {
-	Input string `json:"input"`
-	Model string `json:"model"`
+	Input          string `json:"input"`
+	Model          string `json:"model"`
+	EncodingFormat string `json:"encoding_format,omitempty"`
+	Dimensions     int    `json:"dimensions,omitempty"`
 }
 
 // EmbeddingRequestBatch is an array input request.
 type EmbeddingRequestBatch struct {
-	Input []string `json:"input"`
-	Model string   `json:"model"`
+	Input          []string `json:"input"`
+	Model          string   `json:"model"`
+	EncodingFormat string   `json:"encoding_format,omitempty"`
+	Dimensions     int      `json:"dimensions,omitempty"`
 }
 
 // EmbeddingResponse is the top-level response envelope.
@@ -199,10 +223,11 @@ type EmbeddingResponse struct {
 }
 
 // EmbeddingData is a single embedding result.
+// Embedding field is interface{} to support both []float64 and base64 string.
 type EmbeddingData struct {
-	Object    string    `json:"object"`
-	Index     int       `json:"index"`
-	Embedding []float64 `json:"embedding"`
+	Object    string      `json:"object"`
+	Index     int         `json:"index"`
+	Embedding interface{} `json:"embedding"`
 }
 
 // --- API response types ---

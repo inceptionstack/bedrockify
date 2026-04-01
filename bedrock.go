@@ -5,7 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -26,10 +29,27 @@ type BedrockConverser struct {
 	region   string
 }
 
+// awsRetryConfig holds testable retry configuration.
+type awsRetryConfig struct {
+	maxAttempts int
+	mode        string
+}
+
+// buildAWSRetryConfig returns the standard retry configuration used by Bedrock clients.
+func buildAWSRetryConfig() awsRetryConfig {
+	return awsRetryConfig{
+		maxAttempts: 8,
+		mode:        "adaptive",
+	}
+}
+
 // NewBedrockConverser creates a Bedrock-backed converser using the default AWS credential chain.
 func NewBedrockConverser(region, modelID, baseURL string) (*BedrockConverser, error) {
+	retryCfg := buildAWSRetryConfig()
 	opts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
+		config.WithRetryMaxAttempts(retryCfg.maxAttempts),
+		config.WithRetryMode("adaptive"),
 	}
 	cfg, err := config.LoadDefaultConfig(context.Background(), opts...)
 	if err != nil {
@@ -176,8 +196,12 @@ func (b *BedrockConverser) ConverseStream(ctx context.Context, req *ChatRequest)
 
 				case *brtypes.ContentBlockDeltaMemberReasoningContent:
 					// Emit reasoning/thinking delta
-					if rt, ok := d.Value.(*brtypes.ReasoningContentBlockDeltaMemberText); ok {
+					switch rt := d.Value.(type) {
+					case *brtypes.ReasoningContentBlockDeltaMemberText:
 						ch <- StreamEvent{ReasoningContent: rt.Value}
+					case *brtypes.ReasoningContentBlockDeltaMemberSignature:
+						// Feature 5.3: signature delta — emit as SignatureBlock event
+						ch <- StreamEvent{ReasoningSignature: rt.Value}
 					}
 				}
 
@@ -248,6 +272,43 @@ func (b *BedrockConverser) ListModels(ctx context.Context) ([]ModelInfo, error) 
 	return models, nil
 }
 
+// noPrefillModels is the set of model ID substrings that reject conversations
+// ending with an assistant message (no-prefill constraint).
+var noPrefillModels = []string{
+	"claude-opus-4-6",
+}
+
+// isNoPrefillModel returns true if the model rejects assistant-ending conversations.
+func isNoPrefillModel(modelID string) bool {
+	lower := strings.ToLower(modelID)
+	for _, s := range noPrefillModels {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// conflictModels is the set of model ID substrings where Bedrock rejects
+// requests that include both temperature AND topP simultaneously.
+// For these models, we drop topP when both are specified.
+var conflictModels = []string{
+	"claude-sonnet-4-5",
+	"claude-haiku-4-5",
+	"claude-opus-4-5",
+}
+
+// isConflictModel returns true if the model rejects temp+topP simultaneously.
+func isConflictModel(modelID string) bool {
+	lower := strings.ToLower(modelID)
+	for _, s := range conflictModels {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // --- Input builder ---
 
 func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.ConverseInput, error) {
@@ -290,6 +351,19 @@ func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.Conve
 		System:   system,
 	}
 
+	// Feature 1.6: no-prefill — append user continuation when last message is assistant
+	if len(messages) > 0 &&
+		messages[len(messages)-1].Role == brtypes.ConversationRoleAssistant &&
+		isNoPrefillModel(modelID) {
+		messages = append(messages, brtypes.Message{
+			Role: brtypes.ConversationRoleUser,
+			Content: []brtypes.ContentBlock{
+				&brtypes.ContentBlockMemberText{Value: "Please continue."},
+			},
+		})
+		input.Messages = messages
+	}
+
 	// Inference config
 	ic := &brtypes.InferenceConfiguration{}
 	hasIC := false
@@ -313,6 +387,11 @@ func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.Conve
 		input.InferenceConfig = ic
 	}
 
+	// For conflict models, drop topP when both temperature and topP are set
+	if ic.Temperature != nil && ic.TopP != nil && isConflictModel(modelID) {
+		ic.TopP = nil
+	}
+
 	// Tool config
 	if len(req.Tools) > 0 {
 		toolConfig, err := convertTools(req.Tools)
@@ -325,7 +404,13 @@ func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.Conve
 	// Thinking / reasoning config via AdditionalModelRequestFields
 	thinkingConfig, budgetTokens := buildThinkingConfig(req, maxTokens)
 	if thinkingConfig != nil {
-		input.AdditionalModelRequestFields = brdoc.NewLazyDocument(thinkingConfig)
+		// Merge extra_body passthrough keys into thinkingConfig
+		merged := mergeExtraBodyPassthrough(thinkingConfig, req.ExtraBody)
+		input.AdditionalModelRequestFields = brdoc.NewLazyDocument(merged)
+		// Bedrock rejects requests with topP when thinking/reasoning is active.
+		if ic.TopP != nil {
+			ic.TopP = nil
+		}
 		// Bedrock requires max_tokens > budget_tokens for thinking.
 		// Auto-bump max_tokens if needed so the request doesn't get rejected.
 		if budgetTokens > 0 && maxTokens <= budgetTokens {
@@ -336,6 +421,12 @@ func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.Conve
 			}
 			input.InferenceConfig = ic
 		}
+	} else {
+		// No thinking config — still pass through any non-caching extra_body keys
+		passthrough := buildExtraBodyPassthrough(req.ExtraBody)
+		if len(passthrough) > 0 {
+			input.AdditionalModelRequestFields = brdoc.NewLazyDocument(passthrough)
+		}
 	}
 
 	return input, nil
@@ -345,6 +436,8 @@ func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.Conve
 // and the budget_tokens value (0 if no thinking config). Returns (nil, 0) if no thinking
 // config should be set.
 func buildThinkingConfig(req *ChatRequest, maxTokens int) (map[string]interface{}, int) {
+	modelID := req.Model
+
 	// Priority 1: explicit extra_body.thinking config (Feature 2: Interleaved Thinking)
 	if req.ExtraBody != nil {
 		if thinking, ok := req.ExtraBody["thinking"].(map[string]interface{}); ok {
@@ -363,6 +456,14 @@ func buildThinkingConfig(req *ChatRequest, maxTokens int) (map[string]interface{
 	// Priority 2: reasoning_effort field (Feature 1: Reasoning)
 	if req.ReasoningEffort != "" {
 		budget := computeReasoningBudget(req.ReasoningEffort, maxTokens)
+
+		// DeepSeek v3 uses string format: reasoning_config: "high"
+		if isDeepSeekModel(modelID) {
+			return map[string]interface{}{
+				"reasoning_config": req.ReasoningEffort,
+			}, budget
+		}
+
 		return map[string]interface{}{
 			"thinking": map[string]interface{}{
 				"type":          "enabled",
@@ -374,43 +475,101 @@ func buildThinkingConfig(req *ChatRequest, maxTokens int) (map[string]interface{
 	return nil, 0
 }
 
+// isDeepSeekModel returns true if the model is a DeepSeek variant.
+func isDeepSeekModel(modelID string) bool {
+	lower := strings.ToLower(modelID)
+	return strings.Contains(lower, "deepseek")
+}
+
 // computeReasoningBudget maps a reasoning effort level to a token budget.
-// low=30%, medium=60%, high=100% of maxTokens, with a minimum of 1024.
+// low=30%, medium=60%, high=max_tokens-1 (BAG spec), with a minimum of 1024.
 func computeReasoningBudget(effort string, maxTokens int) int {
 	if maxTokens <= 0 {
 		maxTokens = 8192 // sensible default
 	}
-	var fraction float64
+	var budget int
 	switch effort {
 	case "low":
-		fraction = 0.30
+		budget = int(float64(maxTokens) * 0.30)
 	case "medium":
-		fraction = 0.60
+		budget = int(float64(maxTokens) * 0.60)
 	case "high":
-		fraction = 1.0
+		// BAG spec: high = max_tokens - 1
+		budget = maxTokens - 1
 	default:
-		fraction = 0.60
+		budget = int(float64(maxTokens) * 0.60)
 	}
-	budget := int(float64(maxTokens) * fraction)
 	if budget < 1024 {
 		budget = 1024
 	}
 	return budget
 }
 
-// extractPromptCachingConfig reads prompt_caching config from extra_body.
+// extractPromptCachingConfig reads prompt_caching config from extra_body,
+// falling back to the ENABLE_PROMPT_CACHING environment variable as global default.
 // Returns (cachingSystem, cachingMessages).
 func extractPromptCachingConfig(extraBody map[string]interface{}) (bool, bool) {
+	globalDefault := os.Getenv("ENABLE_PROMPT_CACHING") == "1" || os.Getenv("ENABLE_PROMPT_CACHING") == "true"
+
 	if extraBody == nil {
-		return false, false
+		return globalDefault, globalDefault
 	}
 	pc, ok := extraBody["prompt_caching"].(map[string]interface{})
 	if !ok {
-		return false, false
+		return globalDefault, globalDefault
 	}
-	cachingSystem, _ := pc["system"].(bool)
-	cachingMessages, _ := pc["messages"].(bool)
+	// explicit false overrides global default
+	cachingSystem := globalDefault
+	cachingMessages := globalDefault
+	if v, ok := pc["system"].(bool); ok {
+		cachingSystem = v
+	}
+	if v, ok := pc["messages"].(bool); ok {
+		cachingMessages = v
+	}
 	return cachingSystem, cachingMessages
+}
+
+// filteredExtraBodyKeys are keys in extra_body that are handled separately
+// and should NOT be passed through as-is to AdditionalModelRequestFields.
+var filteredExtraBodyKeys = map[string]bool{
+	"prompt_caching": true,
+	"thinking":       true, // handled by buildThinkingConfig
+}
+
+// buildExtraBodyPassthrough returns a map of extra_body keys that should be
+// passed through to AdditionalModelRequestFields (excluding known handled keys).
+func buildExtraBodyPassthrough(extraBody map[string]interface{}) map[string]interface{} {
+	if extraBody == nil {
+		return nil
+	}
+	result := make(map[string]interface{})
+	for k, v := range extraBody {
+		if !filteredExtraBodyKeys[k] {
+			result[k] = v
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// mergeExtraBodyPassthrough merges extra_body passthrough keys into an existing
+// AdditionalModelRequestFields map without overwriting existing keys.
+func mergeExtraBodyPassthrough(base map[string]interface{}, extraBody map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{}, len(base))
+	for k, v := range base {
+		result[k] = v
+	}
+	for k, v := range extraBody {
+		if !filteredExtraBodyKeys[k] {
+			if _, exists := result[k]; !exists {
+				result[k] = v
+			}
+		}
+	}
+	return result
 }
 
 // --- Message conversion ---
@@ -422,7 +581,7 @@ func convertMessages(msgs []Message) ([]brtypes.Message, []brtypes.SystemContent
 
 	for _, m := range msgs {
 		switch m.Role {
-		case "system":
+		case "system", "developer":
 			text := MessageContent(m)
 			system = append(system, &brtypes.SystemContentBlockMemberText{Value: text})
 
@@ -431,20 +590,30 @@ func convertMessages(msgs []Message) ([]brtypes.Message, []brtypes.SystemContent
 			if err != nil {
 				return nil, nil, err
 			}
-			bedrockMsgs = append(bedrockMsgs, brtypes.Message{
-				Role:    brtypes.ConversationRoleUser,
-				Content: blocks,
-			})
+			// Coalesce consecutive same-role messages
+			if len(bedrockMsgs) > 0 && bedrockMsgs[len(bedrockMsgs)-1].Role == brtypes.ConversationRoleUser {
+				bedrockMsgs[len(bedrockMsgs)-1].Content = append(bedrockMsgs[len(bedrockMsgs)-1].Content, blocks...)
+			} else {
+				bedrockMsgs = append(bedrockMsgs, brtypes.Message{
+					Role:    brtypes.ConversationRoleUser,
+					Content: blocks,
+				})
+			}
 
 		case "assistant":
 			blocks, err := assistantContentToBlocks(m)
 			if err != nil {
 				return nil, nil, err
 			}
-			bedrockMsgs = append(bedrockMsgs, brtypes.Message{
-				Role:    brtypes.ConversationRoleAssistant,
-				Content: blocks,
-			})
+			// Coalesce consecutive same-role messages
+			if len(bedrockMsgs) > 0 && bedrockMsgs[len(bedrockMsgs)-1].Role == brtypes.ConversationRoleAssistant {
+				bedrockMsgs[len(bedrockMsgs)-1].Content = append(bedrockMsgs[len(bedrockMsgs)-1].Content, blocks...)
+			} else {
+				bedrockMsgs = append(bedrockMsgs, brtypes.Message{
+					Role:    brtypes.ConversationRoleAssistant,
+					Content: blocks,
+				})
+			}
 
 		case "tool":
 			// Tool result — must be packaged as a user message with toolResult block
@@ -489,9 +658,15 @@ func contentToBlocks(m Message) ([]brtypes.ContentBlock, error) {
 				}
 			case "image_url":
 				if iu, ok := p["image_url"].(map[string]interface{}); ok {
-					if url, ok := iu["url"].(string); ok && strings.HasPrefix(url, "data:") {
-						imgBlock, err := parseDataURLImage(url)
-						if err == nil {
+					if url, ok := iu["url"].(string); ok {
+						var imgBlock brtypes.ContentBlock
+						var err error
+						if strings.HasPrefix(url, "data:") {
+							imgBlock, err = parseDataURLImage(url)
+						} else if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+							imgBlock, err = fetchRemoteImage(url)
+						}
+						if err == nil && imgBlock != nil {
 							blocks = append(blocks, imgBlock)
 						}
 					}
@@ -553,6 +728,52 @@ func toolResultToBlock(m Message) (brtypes.ContentBlock, error) {
 			ToolUseId: aws.String(m.ToolCallID),
 			Content: []brtypes.ToolResultContentBlock{
 				&brtypes.ToolResultContentBlockMemberText{Value: text},
+			},
+		},
+	}, nil
+}
+
+// fetchRemoteImage fetches an image from a URL and returns a Bedrock image block.
+func fetchRemoteImage(url string) (brtypes.ContentBlock, error) {
+	resp, err := http.Get(url) //nolint:gosec
+	if err != nil {
+		return nil, fmt.Errorf("fetch image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	imgBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read image: %w", err)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	// Strip parameters (e.g. "image/png; charset=...")
+	if idx := strings.Index(contentType, ";"); idx >= 0 {
+		contentType = strings.TrimSpace(contentType[:idx])
+	}
+
+	var format brtypes.ImageFormat
+	switch contentType {
+	case "image/jpeg", "image/jpg":
+		format = brtypes.ImageFormatJpeg
+	case "image/png":
+		format = brtypes.ImageFormatPng
+	case "image/gif":
+		format = brtypes.ImageFormatGif
+	case "image/webp":
+		format = brtypes.ImageFormatWebp
+	default:
+		format = brtypes.ImageFormatJpeg
+	}
+
+	return &brtypes.ContentBlockMemberImage{
+		Value: brtypes.ImageBlock{
+			Format: format,
+			Source: &brtypes.ImageSourceMemberBytes{
+				Value: imgBytes,
 			},
 		},
 	}, nil
@@ -700,6 +921,27 @@ func parseConverseOutput(resp *bedrockruntime.ConverseOutput, modelID string) (*
 			PromptTokens:     int(inputTokens),
 			CompletionTokens: int(outputTokens),
 			TotalTokens:      int(inputTokens + outputTokens),
+		}
+		// Feature 3.1: prompt_tokens_details.cached_tokens
+		cachedRead := int32(0)
+		if resp.Usage.CacheReadInputTokens != nil {
+			cachedRead = *resp.Usage.CacheReadInputTokens
+		}
+		if resp.Usage.CacheWriteInputTokens != nil {
+			// both read and write count as cached
+			cachedRead += *resp.Usage.CacheWriteInputTokens
+		}
+		if cachedRead > 0 {
+			usage.PromptTokensDetails = &PromptTokensDetails{CachedTokens: int(cachedRead)}
+		}
+		// Feature 3.2: completion_tokens_details.reasoning_tokens
+		if reasoningContent != "" {
+			// Estimate: ~1 token per 4 chars
+			estimated := len(reasoningContent) / 4
+			if estimated < 1 {
+				estimated = 1
+			}
+			usage.CompletionTokensDetails = &CompletionTokensDetails{ReasoningTokens: estimated}
 		}
 	}
 

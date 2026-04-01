@@ -49,7 +49,15 @@ func (s *SSEWriter) SendDone() {
 
 // Stream reads events from ch and writes SSE chunks to the client.
 // model and reqID are used to populate the chunk metadata.
+// Wraps StreamWithOptions with includeUsage=false for backward compatibility.
 func Stream(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string) {
+	StreamWithOptions(w, ch, model, reqID, false)
+}
+
+// StreamWithOptions reads events from ch and writes SSE chunks to the client.
+// When includeUsage=true, usage is sent as a separate final chunk with empty choices
+// (OpenAI stream_options.include_usage behavior).
+func StreamWithOptions(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string, includeUsage bool) {
 	sse, err := NewSSEWriter(w)
 	if err != nil {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -72,6 +80,8 @@ func Stream(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string) {
 		},
 	}
 	_ = sse.SendChunk(roleChunk)
+
+	var pendingUsage *Usage
 
 	for event := range ch {
 		if event.Err != nil {
@@ -150,9 +160,13 @@ func Stream(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string) {
 		if event.FinishReason != "" {
 			reason := event.FinishReason
 			var finishUsage *Usage
-			// Collect usage from next event if available
 			if event.Usage != nil {
-				finishUsage = event.Usage
+				if includeUsage {
+					// With include_usage=true: send usage in a separate chunk after finish
+					pendingUsage = event.Usage
+				} else {
+					finishUsage = event.Usage
+				}
 			}
 			chunk := StreamChunk{
 				ID:      reqID,
@@ -173,16 +187,33 @@ func Stream(w http.ResponseWriter, ch <-chan StreamEvent, model, reqID string) {
 
 		if event.FinishReason == "" && event.Usage != nil {
 			// Usage-only event (after finish reason was already sent)
-			chunk := StreamChunk{
-				ID:      reqID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []StreamChoice{},
-				Usage:   event.Usage,
+			if includeUsage {
+				pendingUsage = event.Usage
+			} else {
+				chunk := StreamChunk{
+					ID:      reqID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []StreamChoice{},
+					Usage:   event.Usage,
+				}
+				_ = sse.SendChunk(chunk)
 			}
-			_ = sse.SendChunk(chunk)
 		}
+	}
+
+	// If include_usage=true, send a final usage-only chunk with empty choices
+	if includeUsage && pendingUsage != nil {
+		usageChunk := StreamChunk{
+			ID:      reqID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []StreamChoice{},
+			Usage:   pendingUsage,
+		}
+		_ = sse.SendChunk(usageChunk)
 	}
 
 	sse.SendDone()

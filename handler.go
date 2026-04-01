@@ -179,7 +179,8 @@ func (h *Handler) handleStreaming(w http.ResponseWriter, r *http.Request, req *C
 	}
 
 	reqID := newRequestID()
-	Stream(w, ch, req.Model, reqID)
+	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+	StreamWithOptions(w, ch, req.Model, reqID, includeUsage)
 }
 
 // handleEmbeddings handles POST /v1/embeddings.

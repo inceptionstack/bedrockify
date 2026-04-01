@@ -444,8 +444,8 @@ func TestSingleEmbedding(t *testing.T) {
 	if len(resp.Data) != 1 {
 		t.Fatalf("expected 1 embedding, got %d", len(resp.Data))
 	}
-	if len(resp.Data[0].Embedding) != 1024 {
-		t.Errorf("expected 1024 dims, got %d", len(resp.Data[0].Embedding))
+	if len(resp.Data[0].Embedding.([]interface{})) != 1024 {
+		t.Errorf("expected 1024 dims, got %d", len(resp.Data[0].Embedding.([]interface{})))
 	}
 	if resp.Data[0].Index != 0 {
 		t.Errorf("expected index 0, got %d", resp.Data[0].Index)
@@ -511,7 +511,7 @@ func TestCohereV4SingleEmbedding(t *testing.T) {
 	if resp.Model != "cohere.embed-v4:0" {
 		t.Errorf("expected model 'cohere.embed-v4:0', got '%s'", resp.Model)
 	}
-	if len(resp.Data) != 1 || len(resp.Data[0].Embedding) != 1536 {
+	if len(resp.Data) != 1 || len(resp.Data[0].Embedding.([]interface{})) != 1536 {
 		t.Errorf("expected 1 embedding with 1536 dims")
 	}
 }
