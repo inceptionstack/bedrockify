@@ -323,24 +323,39 @@ func buildConverseInput(modelID string, req *ChatRequest) (*bedrockruntime.Conve
 	}
 
 	// Thinking / reasoning config via AdditionalModelRequestFields
-	thinkingConfig := buildThinkingConfig(req, maxTokens)
+	thinkingConfig, budgetTokens := buildThinkingConfig(req, maxTokens)
 	if thinkingConfig != nil {
 		input.AdditionalModelRequestFields = brdoc.NewLazyDocument(thinkingConfig)
+		// Bedrock requires max_tokens > budget_tokens for thinking.
+		// Auto-bump max_tokens if needed so the request doesn't get rejected.
+		if budgetTokens > 0 && maxTokens <= budgetTokens {
+			adjusted := budgetTokens + 1024
+			ic.MaxTokens = aws.Int32(int32(adjusted))
+			if !hasIC {
+				hasIC = true
+			}
+			input.InferenceConfig = ic
+		}
 	}
 
 	return input, nil
 }
 
-// buildThinkingConfig returns the AdditionalModelRequestFields map for thinking/reasoning,
-// or nil if no thinking config should be set.
-func buildThinkingConfig(req *ChatRequest, maxTokens int) map[string]interface{} {
+// buildThinkingConfig returns the AdditionalModelRequestFields map for thinking/reasoning
+// and the budget_tokens value (0 if no thinking config). Returns (nil, 0) if no thinking
+// config should be set.
+func buildThinkingConfig(req *ChatRequest, maxTokens int) (map[string]interface{}, int) {
 	// Priority 1: explicit extra_body.thinking config (Feature 2: Interleaved Thinking)
 	if req.ExtraBody != nil {
 		if thinking, ok := req.ExtraBody["thinking"].(map[string]interface{}); ok {
 			if ttype, ok := thinking["type"].(string); ok && ttype == "enabled" {
+				budget := 0
+				if bt, ok := thinking["budget_tokens"].(float64); ok {
+					budget = int(bt)
+				}
 				return map[string]interface{}{
 					"thinking": thinking,
-				}
+				}, budget
 			}
 		}
 	}
@@ -353,10 +368,10 @@ func buildThinkingConfig(req *ChatRequest, maxTokens int) map[string]interface{}
 				"type":          "enabled",
 				"budget_tokens": budget,
 			},
-		}
+		}, budget
 	}
 
-	return nil
+	return nil, 0
 }
 
 // computeReasoningBudget maps a reasoning effort level to a token budget.
