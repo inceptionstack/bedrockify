@@ -49,6 +49,10 @@ curl http://127.0.0.1:8090/v1/embeddings \
 - **Streaming** — SSE streaming for chat completions
 - **Tool use** — function calling via Bedrock Converse
 - **Vision** — image inputs (base64 data URLs)
+- **Reasoning / Extended Thinking** — `reasoning_effort` (low/medium/high) for Claude 3.7/4/4.5 + DeepSeek R1 with `reasoning_content` in responses
+- **Interleaved Thinking** — `extra_body.thinking` for Claude 4/4.5 thinking between tool calls
+- **Prompt Caching** — `extra_body.prompt_caching` for up to 90% cost reduction on repeated prompts
+- **Application Inference Profiles** — pass ARN as model ID for cost tracking
 - **Model aliases** — short names, OpenRouter IDs, bare Bedrock IDs all work
 - **Auth** — IAM/SigV4 (default) or Bedrock API key (bearer token)
 - **Config** — TOML file, env vars, CLI flags (layered priority)
@@ -170,6 +174,122 @@ Cross-region inference prefixes (`us.`, `eu.`, `ap.`) are added automatically ba
 | `cohere.embed-english-v3` | 1024 | Cohere v3, English |
 | `cohere.embed-multilingual-v3` | 1024 | Cohere v3, multilingual |
 | `cohere.embed-v4:0` | 1536 | Cohere v4, latest |
+
+---
+
+## Reasoning / Extended Thinking
+
+Enable chain-of-thought reasoning for Claude 3.7/4/4.5 and DeepSeek R1. The model's thinking is returned in a separate `reasoning_content` field.
+
+```bash
+curl http://127.0.0.1:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet",
+    "messages": [{"role": "user", "content": "Which is larger: 9.11 or 9.8?"}],
+    "max_completion_tokens": 4096,
+    "reasoning_effort": "low"
+  }'
+```
+
+**Response includes `reasoning_content`:**
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": "9.8 is larger than 9.11.",
+      "reasoning_content": "Comparing 9.11 and 9.8:\n9.8 = 9.80\n9.80 > 9.11\nSo 9.8 is larger."
+    }
+  }]
+}
+```
+
+| Level | Budget | Use Case |
+|-------|--------|----------|
+| `low` | 30% of max_tokens (min 1024) | Quick comparisons, simple reasoning |
+| `medium` | 60% of max_tokens (min 1024) | Standard analysis |
+| `high` | 100% of max_tokens (min 1024) | Complex math, coding, deep analysis |
+
+Streaming also works — reasoning deltas arrive before content deltas:
+```bash
+curl http://127.0.0.1:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet", "messages": [{"role": "user", "content": "9.11 vs 9.8?"}], "max_completion_tokens": 4096, "reasoning_effort": "low", "stream": true}'
+```
+
+---
+
+## Interleaved Thinking
+
+For Claude 4/4.5, enable thinking between tool calls using `extra_body.thinking`. The model thinks before and after each tool result, producing better agentic decisions.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8090/v1", api_key="not-used")
+
+response = client.chat.completions.create(
+    model="claude-sonnet",
+    messages=[{"role": "user", "content": "What is 15 * 17?"}],
+    max_tokens=2048,
+    extra_body={
+        "thinking": {"type": "enabled", "budget_tokens": 4096}
+    }
+)
+
+print(response.choices[0].message.reasoning_content)  # Chain of thought
+print(response.choices[0].message.content)              # Final answer
+```
+
+> **Note:** `budget_tokens` can exceed `max_tokens` — bedrockify auto-adjusts `max_tokens` so the request is valid.
+
+---
+
+## Prompt Caching
+
+Reduce costs by up to 90% and latency by up to 85% for workloads with repeated prompts (system prompts, few-shot examples). Works with Claude and Nova models.
+
+```python
+response = client.chat.completions.create(
+    model="claude-sonnet",
+    messages=[
+        {"role": "system", "content": "You are an expert assistant with..."},  # Long system prompt
+        {"role": "user", "content": "Help me with this task"}
+    ],
+    extra_body={
+        "prompt_caching": {"system": True}  # Cache the system prompt
+    }
+)
+```
+
+**Cache options:**
+
+| Option | Effect |
+|--------|--------|
+| `{"system": true}` | Cache system prompt |
+| `{"messages": true}` | Cache conversation history |
+| `{"system": true, "messages": true}` | Cache both |
+
+Requirements: prompt must be ≥1,024 tokens for caching to activate. Cache TTL is 5 minutes (resets on each cache hit).
+
+---
+
+## Application Inference Profiles
+
+Pass an Application Inference Profile ARN as the model ID for per-application cost tracking:
+
+```bash
+curl http://127.0.0.1:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/my-app",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 100
+  }'
+```
+
+ARNs pass through directly — no alias resolution or cross-region prefix is applied.
 
 ---
 

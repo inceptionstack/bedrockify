@@ -1001,3 +1001,140 @@ func isCachePointContentBlock(block brtypes.ContentBlock) bool {
 	_, ok := block.(*brtypes.ContentBlockMemberCachePoint)
 	return ok
 }
+
+// --- Tests for max_tokens auto-bump when budget_tokens >= max_tokens ---
+
+func TestMaxTokensAutoBumpWhenBudgetExceedsMax(t *testing.T) {
+	// extra_body.thinking with budget=4096, max_tokens=2048 → should bump max_tokens
+	req := &ChatRequest{
+		Model:     "us.anthropic.claude-sonnet-4-6",
+		Messages:  []Message{{Role: "user", Content: "test"}},
+		MaxTokens: 2048,
+		ExtraBody: map[string]interface{}{
+			"thinking": map[string]interface{}{
+				"type":          "enabled",
+				"budget_tokens": float64(4096),
+			},
+		},
+	}
+	input, err := buildConverseInput("us.anthropic.claude-sonnet-4-6", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if input.InferenceConfig == nil || input.InferenceConfig.MaxTokens == nil {
+		t.Fatal("expected InferenceConfig.MaxTokens to be set")
+	}
+	maxTokens := int(*input.InferenceConfig.MaxTokens)
+	if maxTokens <= 4096 {
+		t.Errorf("expected max_tokens > 4096 (budget), got %d", maxTokens)
+	}
+	if maxTokens != 5120 { // 4096 + 1024
+		t.Errorf("expected max_tokens = 5120, got %d", maxTokens)
+	}
+}
+
+func TestMaxTokensNotBumpedWhenBudgetUnderMax(t *testing.T) {
+	// reasoning_effort=low with max=4096 → budget=1228 (30%), no bump needed
+	req := &ChatRequest{
+		Model:               "us.anthropic.claude-sonnet-4-6",
+		Messages:            []Message{{Role: "user", Content: "test"}},
+		MaxCompletionTokens: 4096,
+		ReasoningEffort:     "low",
+	}
+	input, err := buildConverseInput("us.anthropic.claude-sonnet-4-6", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if input.InferenceConfig == nil || input.InferenceConfig.MaxTokens == nil {
+		t.Fatal("expected InferenceConfig.MaxTokens to be set")
+	}
+	maxTokens := int(*input.InferenceConfig.MaxTokens)
+	if maxTokens != 4096 {
+		t.Errorf("expected max_tokens to remain 4096, got %d", maxTokens)
+	}
+}
+
+func TestMaxTokensBumpedForReasoningEffortHigh(t *testing.T) {
+	// reasoning_effort=high with max=4096 → budget=4096 (100%), must bump
+	req := &ChatRequest{
+		Model:               "us.anthropic.claude-sonnet-4-6",
+		Messages:            []Message{{Role: "user", Content: "test"}},
+		MaxCompletionTokens: 4096,
+		ReasoningEffort:     "high",
+	}
+	input, err := buildConverseInput("us.anthropic.claude-sonnet-4-6", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	maxTokens := int(*input.InferenceConfig.MaxTokens)
+	if maxTokens <= 4096 {
+		t.Errorf("expected max_tokens > 4096 for high reasoning, got %d", maxTokens)
+	}
+}
+
+func TestMaxCompletionTokensTakesPrecedence(t *testing.T) {
+	// max_completion_tokens should override max_tokens
+	req := &ChatRequest{
+		Model:               "us.anthropic.claude-sonnet-4-6",
+		Messages:            []Message{{Role: "user", Content: "test"}},
+		MaxTokens:           100,
+		MaxCompletionTokens: 8192,
+	}
+	input, err := buildConverseInput("us.anthropic.claude-sonnet-4-6", req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	maxTokens := int(*input.InferenceConfig.MaxTokens)
+	if maxTokens != 8192 {
+		t.Errorf("expected max_tokens=8192 (from MaxCompletionTokens), got %d", maxTokens)
+	}
+}
+
+func TestBuildThinkingConfigReturnsNilWhenNoReasoning(t *testing.T) {
+	req := &ChatRequest{
+		Model:    "us.anthropic.claude-sonnet-4-6",
+		Messages: []Message{{Role: "user", Content: "test"}},
+	}
+	cfg, budget := buildThinkingConfig(req, 4096)
+	if cfg != nil {
+		t.Errorf("expected nil config, got %v", cfg)
+	}
+	if budget != 0 {
+		t.Errorf("expected budget=0, got %d", budget)
+	}
+}
+
+func TestBuildThinkingConfigExtraBodyPriority(t *testing.T) {
+	// extra_body.thinking takes priority over reasoning_effort
+	req := &ChatRequest{
+		ReasoningEffort: "low",
+		ExtraBody: map[string]interface{}{
+			"thinking": map[string]interface{}{
+				"type":          "enabled",
+				"budget_tokens": float64(8000),
+			},
+		},
+	}
+	cfg, budget := buildThinkingConfig(req, 4096)
+	if cfg == nil {
+		t.Fatal("expected thinking config")
+	}
+	if budget != 8000 {
+		t.Errorf("expected budget=8000 from extra_body, got %d", budget)
+	}
+}
+
+func TestMaxCompletionTokensJSON(t *testing.T) {
+	// Verify max_completion_tokens deserializes correctly from JSON
+	body := `{"model":"test","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":8192,"max_tokens":100}`
+	var req ChatRequest
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if req.MaxCompletionTokens != 8192 {
+		t.Errorf("expected MaxCompletionTokens=8192, got %d", req.MaxCompletionTokens)
+	}
+	if req.MaxTokens != 100 {
+		t.Errorf("expected MaxTokens=100, got %d", req.MaxTokens)
+	}
+}
